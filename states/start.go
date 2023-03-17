@@ -43,6 +43,9 @@ func Start() State {
 		getOpenWorkspaceCmd(state, app.config),
 		// pulsarctl
 		getPulsarctlCmd(state),
+		//
+		GetParseIndexParamCmd(),
+		GetOrganizeIndexFilesCmd(),
 		// exit
 		getExitCmd(state))
 
