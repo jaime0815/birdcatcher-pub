@@ -11,6 +11,7 @@ import (
 
 	"github.com/c-bata/go-prompt"
 	"github.com/manifoldco/promptui"
+
 	_ "github.com/milvus-io/birdwatcher/asap"
 	"github.com/milvus-io/birdwatcher/states"
 )
@@ -19,6 +20,13 @@ var (
 	simple = flag.Bool("simple", false, "use simple ui without suggestion and history")
 	olc    = flag.Bool("olc", false, "use one line command mode")
 	olcCmd = flag.String("olcCmd", "", "one line command cmd")
+
+	rcn            = flag.Bool("setPChanPrefix", false, "use one line command, set pchannel prefix for all collections")
+	addr           = flag.String("addr", "", "etcd address")
+	rootPath       = flag.String("rootPath", "", "etcd address")
+	oldPChanPrefix = flag.String("oldPChanPrefix", "", "old pchannel prefix")
+	newPChanPrefix = flag.String("newPChanPrefix", "", "new pchannel prefix")
+
 	logger *log.Logger
 )
 
@@ -26,6 +34,13 @@ func main() {
 	flag.Parse()
 	if *olc {
 		states.ExecOLC(*olcCmd)
+		return
+	}
+
+	if *rcn {
+		if err := states.SetChannel(*addr, *rootPath, *oldPChanPrefix, *newPChanPrefix); err != nil {
+			panic(err)
+		}
 		return
 	}
 	defer handleExit()
