@@ -105,11 +105,11 @@ func getETCDClient(instance *InstanceInfo) (*clientv3.Client, error) {
 	return etcdCli, nil
 }
 
-func listCollections(cli clientv3.KV, basePath string) ([]string, []etcdpbv2.CollectionInfo, error) {
+func listCollections(cli clientv3.KV, basePath string, metaPath string) ([]string, []etcdpbv2.CollectionInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
 	defer cancel()
 	colls, keys, err := common.ListProtoObjectsAdv(ctx, cli,
-		path.Join(basePath, common.CollectionMetaPrefix),
+		path.Join(basePath, metaPath),
 		func(_ string, value []byte) bool {
 			return true
 		},
@@ -118,7 +118,7 @@ func listCollections(cli clientv3.KV, basePath string) ([]string, []etcdpbv2.Col
 		})
 
 	snapshotColls, snapshotKeys, err := common.ListProtoObjectsAdv(ctx, cli,
-		path.Join(basePath, "snapshots/root-coord/collection"),
+		path.Join(basePath, path.Join("snapshots", metaPath)),
 		func(_ string, value []byte) bool {
 			return true
 		},
@@ -263,7 +263,7 @@ func replacePosition(info *internalpb.MsgPosition, oldChanPrefix, newChanPrefix 
 	}
 	//info.MsgID = serializeRmqID(0)
 	info.MsgID = kafka.SerializeKafkaID(0)
-	info.Timestamp = getFutureTime()
+	info.Timestamp = getCurrentTime()
 	info.ChannelName = strings.ReplaceAll(info.ChannelName, oldChanPrefix, newChanPrefix)
 }
 
@@ -277,11 +277,9 @@ func composeTSByTime(physical time.Time, logical int64) uint64 {
 	return composeTS(physical.UnixNano()/int64(time.Millisecond), logical)
 }
 
-// getFutureTime returns the future timestamp
-func getFutureTime() uint64 {
-	now := time.Now().UnixMilli()
-	future := time.UnixMilli(now + 100000000000)
-	return composeTSByTime(future, 0)
+// getCurrentTime returns the future timestamp
+func getCurrentTime() uint64 {
+	return composeTSByTime(time.Now(), 0)
 }
 
 func resetSegmentCheckpoint(cli clientv3.KV, basePath string, oldChanPrefix, newChanPrefix string) error {
@@ -326,10 +324,23 @@ func resetSegmentCheckpoint(cli clientv3.KV, basePath string, oldChanPrefix, new
 }
 
 func replacePChanPrefixWithinSchema(cli clientv3.KV, basePath, oldChanPrefix, newChanPrefix string) error {
-	keys, values, err := listCollections(cli, basePath)
-	if err != nil {
-		return err
+	keys0, values0, err0 := listCollections(cli, basePath, common.CollectionMetaPrefix)
+	if err0 != nil {
+		return err0
 	}
+
+	keys1, values1, err1 := listCollections(cli, basePath, common.CollectionInfoMetaPrefix)
+	if err1 != nil {
+		return err1
+	}
+
+	keys := make([]string, 0)
+	keys = append(keys, keys0...)
+	keys = append(keys, keys1...)
+
+	values := make([]etcdpbv2.CollectionInfo, 0)
+	values = append(values, values0...)
+	values = append(values, values1...)
 
 	if len(keys) != len(values) {
 		return fmt.Errorf("keys size:%d is not equal value size:%d", len(keys), len(values))

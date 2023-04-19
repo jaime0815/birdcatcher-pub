@@ -10,13 +10,14 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/samber/lo"
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/milvus-io/birdwatcher/models"
 	"github.com/milvus-io/birdwatcher/proto/v2.0/etcdpb"
 	"github.com/milvus-io/birdwatcher/proto/v2.0/schemapb"
 	etcdpbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/etcdpb"
 	schemapbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/schemapb"
-	"github.com/samber/lo"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 const (
@@ -26,6 +27,9 @@ const (
 	CollectionLoadPrefix = "queryCoord-collectionMeta"
 	// CollectionLoadPrefixV2 is prefix for querycoord collection loaded in milvus v2.2.x
 	CollectionLoadPrefixV2 = "querycoord-collection-loadinfo"
+
+	DatabaseMetaPrefix       = "root-coord/database"
+	CollectionInfoMetaPrefix = DatabaseMetaPrefix + "/collection-info"
 )
 
 var (
