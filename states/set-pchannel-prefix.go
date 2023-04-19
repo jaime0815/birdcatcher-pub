@@ -5,6 +5,7 @@ package states
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"github.com/golang/protobuf/proto"
@@ -61,13 +62,22 @@ func SetChannel(addr string, rootPath, oldPChanNamePrefix, newPChanNamePrefix st
 	if err = resetChannelWatch(client, basePath, oldPChanNamePrefix, newPChanNamePrefix); err != nil {
 		return err
 	}
+
+	if err = removeRemovalChannel(client, basePath); err != nil {
+		return err
+	}
+
+	if err = resetSegmentCheckpoint(client, basePath, oldPChanNamePrefix, newPChanNamePrefix); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func getETCDClient(instance *InstanceInfo) (*clientv3.Client, error) {
 	etcdCli, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{instance.Addr},
-		DialTimeout: time.Second * 10,
+		DialTimeout: time.Second * 60,
 
 		// disable grpc logging
 		Logger: zap.NewNop(),
@@ -79,7 +89,7 @@ func getETCDClient(instance *InstanceInfo) (*clientv3.Client, error) {
 
 	rootPath := instance.RootPath
 	// ping etcd
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
 	defer cancel()
 	err = pingEtcd(ctx, etcdCli, rootPath, metaPath)
 	if err != nil {
@@ -159,7 +169,7 @@ func resetChannelWatch(cli clientv3.KV, basePath string, oldChanPrefix, newChanP
 			fmt.Printf("channel-watch key:%s, add value fails\n", newKey)
 			return err
 		}
-		fmt.Printf("channel-watch key:%s, add value successfully\n", newKey)
+		fmt.Printf("add channel-watch key:%s,  value successfully\n", newKey)
 
 		// Delete old KV
 		_, err = cli.Delete(ctx, key)
@@ -169,6 +179,27 @@ func resetChannelWatch(cli clientv3.KV, basePath string, oldChanPrefix, newChanP
 		}
 		fmt.Printf("delete key:%s successfully\n", key)
 	}
+	return nil
+}
+
+func removeRemovalChannel(cli clientv3.KV, basePath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
+	defer cancel()
+	resp, err := cli.Get(ctx, path.Join(basePath, "datacoord-meta/channel-removal"), clientv3.WithPrefix())
+	if err != nil {
+		return err
+	}
+	fmt.Println("== remove channel-removal key size:", len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		_, err = cli.Delete(ctx, key)
+		if err != nil {
+			fmt.Printf("delete key:%s fails\n", key)
+			return err
+		}
+		fmt.Printf("delete key:%s successfully\n", key)
+	}
+
 	return nil
 }
 
@@ -183,6 +214,10 @@ func resetChannelCheckPoint(cli clientv3.KV, basePath string, oldChanPrefix, new
 	fmt.Println("== update channel-cp key size:", len(resp.Kvs))
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
+		if !strings.HasPrefix(key, oldChanPrefix) {
+			fmt.Printf("channel-cp:%s has not a prefix:%s\n", key, oldChanPrefix)
+			continue
+		}
 		newKey := strings.ReplaceAll(key, oldChanPrefix, newChanPrefix)
 		newKey = strings.Replace(newKey, newChanPrefix, oldChanPrefix, 1)
 
@@ -191,12 +226,11 @@ func resetChannelCheckPoint(cli clientv3.KV, basePath string, oldChanPrefix, new
 		if err != nil {
 			continue
 		}
-		msgID := kafka.SerializeKafkaID(0)
-		info.MsgID = msgID
+		replacePosition(info, oldChanPrefix, newChanPrefix)
 
 		mv, err := proto.Marshal(info)
 		if err != nil {
-			return fmt.Errorf("failed to marshal segment info: %s", err.Error())
+			return fmt.Errorf("failed to marshal msg position info: %s", err.Error())
 		}
 
 		_, err = cli.Put(ctx, newKey, string(mv))
@@ -213,16 +247,52 @@ func resetChannelCheckPoint(cli clientv3.KV, basePath string, oldChanPrefix, new
 		}
 		fmt.Printf("delete key:%s successfully\n", key)
 	}
+
 	return nil
 }
 
-func resetSegmentCheckpoint(cli clientv3.KV, basePath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+func serializeRmqID(messageID int64) []byte {
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, uint64(messageID))
+	return b
+}
+
+func replacePosition(info *internalpb.MsgPosition, oldChanPrefix, newChanPrefix string) {
+	if info == nil {
+		return
+	}
+	//info.MsgID = serializeRmqID(0)
+	info.MsgID = kafka.SerializeKafkaID(0)
+	info.Timestamp = getFutureTime()
+	info.ChannelName = strings.ReplaceAll(info.ChannelName, oldChanPrefix, newChanPrefix)
+}
+
+// composeTS returns a timestamp composed of physical part and logical part
+func composeTS(physical, logical int64) uint64 {
+	return uint64((physical << logicalBits) + logical)
+}
+
+// composeTSByTime returns a timestamp composed of physical time.Time and logical time
+func composeTSByTime(physical time.Time, logical int64) uint64 {
+	return composeTS(physical.UnixNano()/int64(time.Millisecond), logical)
+}
+
+// getFutureTime returns the future timestamp
+func getFutureTime() uint64 {
+	now := time.Now().UnixMilli()
+	future := time.UnixMilli(now + 100000000000)
+	return composeTSByTime(future, 0)
+}
+
+func resetSegmentCheckpoint(cli clientv3.KV, basePath string, oldChanPrefix, newChanPrefix string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
 	defer cancel()
 	resp, err := cli.Get(ctx, path.Join(basePath, "datacoord-meta/s"), clientv3.WithPrefix())
 	if err != nil {
 		return err
 	}
+
+	fmt.Println("== update segments key size:", len(resp.Kvs))
 	for _, kv := range resp.Kvs {
 		info := &datapb.SegmentInfo{}
 		err = proto.Unmarshal(kv.Value, info)
@@ -230,8 +300,14 @@ func resetSegmentCheckpoint(cli clientv3.KV, basePath string) error {
 			continue
 		}
 
-		info.StartPosition = nil
-		info.DmlPosition = nil
+		if !strings.HasPrefix(info.InsertChannel, oldChanPrefix) {
+			fmt.Printf("segment insert channel:%s has not a prefix:%s\n", info.InsertChannel, oldChanPrefix)
+			continue
+		}
+
+		replacePosition(info.StartPosition, oldChanPrefix, newChanPrefix)
+		replacePosition(info.DmlPosition, oldChanPrefix, newChanPrefix)
+		info.InsertChannel = strings.ReplaceAll(info.InsertChannel, oldChanPrefix, newChanPrefix)
 
 		mv, err := proto.Marshal(info)
 		if err != nil {
@@ -259,7 +335,7 @@ func replacePChanPrefixWithinSchema(cli clientv3.KV, basePath, oldChanPrefix, ne
 		return fmt.Errorf("keys size:%d is not equal value size:%d", len(keys), len(values))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*600)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
 	defer cancel()
 
 	fmt.Println("== update channel prefix of schema key size:", len(keys))
