@@ -8,12 +8,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"path"
+	"regexp"
+	"strings"
+	"time"
+
 	"github.com/golang/protobuf/proto"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
-	"path"
-	"strings"
-	"time"
 
 	"github.com/milvus-io/birdwatcher/mq/kafka"
 	"github.com/milvus-io/birdwatcher/proto/v2.2/datapb"
@@ -32,9 +34,7 @@ func SetChannel(addr string, rootPath, oldPChanNamePrefix, newPChanNamePrefix st
 	if len(rootPath) == 0 {
 		return errors.New("etcd rootpath is empty")
 	}
-	if len(oldPChanNamePrefix) == 0 {
-		return errors.New("oldPChanPrefix is empty")
-	}
+
 	if len(newPChanNamePrefix) == 0 {
 		return errors.New("newPChanPrefix is empty")
 	}
@@ -51,15 +51,15 @@ func SetChannel(addr string, rootPath, oldPChanNamePrefix, newPChanNamePrefix st
 	fmt.Println("Using meta path:", fmt.Sprintf("%s/%s/", rootPath, metaPath))
 	basePath := path.Join(rootPath, metaPath)
 
-	if err = replacePChanPrefixWithinSchema(client, basePath, oldPChanNamePrefix, newPChanNamePrefix); err != nil {
+	if err = replacePChanPrefixWithinSchema(client, basePath, newPChanNamePrefix); err != nil {
 		return err
 	}
 
-	if err = resetChannelCheckPoint(client, basePath, oldPChanNamePrefix, newPChanNamePrefix); err != nil {
+	if err = resetChannelCheckPoint(client, basePath, newPChanNamePrefix); err != nil {
 		return err
 	}
 
-	if err = resetChannelWatch(client, basePath, oldPChanNamePrefix, newPChanNamePrefix); err != nil {
+	if err = resetChannelWatch(client, basePath, newPChanNamePrefix); err != nil {
 		return err
 	}
 
@@ -67,7 +67,7 @@ func SetChannel(addr string, rootPath, oldPChanNamePrefix, newPChanNamePrefix st
 		return err
 	}
 
-	if err = resetSegmentCheckpoint(client, basePath, oldPChanNamePrefix, newPChanNamePrefix); err != nil {
+	if err = resetSegmentCheckpoint(client, basePath, newPChanNamePrefix); err != nil {
 		return err
 	}
 
@@ -131,7 +131,7 @@ func listCollections(cli clientv3.KV, basePath string, metaPath string) ([]strin
 	return keys, colls, err
 }
 
-func resetChannelWatch(cli clientv3.KV, basePath string, oldChanPrefix, newChanPrefix string) error {
+func resetChannelWatch(cli clientv3.KV, basePath string, newChanPrefix string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
 	defer cancel()
 	resp, err := cli.Get(ctx, path.Join(basePath, "channelwatch"), clientv3.WithPrefix())
@@ -147,10 +147,8 @@ func resetChannelWatch(cli clientv3.KV, basePath string, oldChanPrefix, newChanP
 			return err
 		}
 
-		newKey := strings.ReplaceAll(key, oldChanPrefix, newChanPrefix)
-		newKey = strings.Replace(newKey, newChanPrefix, oldChanPrefix, 1)
-
-		vChannelName := strings.ReplaceAll(cw.Vchan.ChannelName, oldChanPrefix, newChanPrefix)
+		newKey := replace(key, newChanPrefix, true)
+		vChannelName := replace(cw.Vchan.ChannelName, newChanPrefix, false)
 
 		vChanInfo := &datapb.VchannelInfo{
 			ChannelName:  vChannelName,
@@ -203,7 +201,7 @@ func removeRemovalChannel(cli clientv3.KV, basePath string) error {
 	return nil
 }
 
-func resetChannelCheckPoint(cli clientv3.KV, basePath string, oldChanPrefix, newChanPrefix string) error {
+func resetChannelCheckPoint(cli clientv3.KV, basePath string, newChanPrefix string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
 	defer cancel()
 	resp, err := cli.Get(ctx, path.Join(basePath, "datacoord-meta/channel-cp"), clientv3.WithPrefix())
@@ -214,19 +212,13 @@ func resetChannelCheckPoint(cli clientv3.KV, basePath string, oldChanPrefix, new
 	fmt.Println("== update channel-cp key size:", len(resp.Kvs))
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
-		if !strings.HasPrefix(key, oldChanPrefix) {
-			fmt.Printf("channel-cp:%s has not a prefix:%s\n", key, oldChanPrefix)
-			continue
-		}
-		newKey := strings.ReplaceAll(key, oldChanPrefix, newChanPrefix)
-		newKey = strings.Replace(newKey, newChanPrefix, oldChanPrefix, 1)
-
+		newKey := replace(key, newChanPrefix, true)
 		info := &internalpb.MsgPosition{}
 		err = proto.Unmarshal(kv.Value, info)
 		if err != nil {
 			continue
 		}
-		replacePosition(info, oldChanPrefix, newChanPrefix)
+		replacePosition(info, newChanPrefix)
 
 		mv, err := proto.Marshal(info)
 		if err != nil {
@@ -257,14 +249,26 @@ func serializeRmqID(messageID int64) []byte {
 	return b
 }
 
-func replacePosition(info *internalpb.MsgPosition, oldChanPrefix, newChanPrefix string) {
+func replacePosition(info *internalpb.MsgPosition, newChanPrefix string) {
 	if info == nil {
 		return
 	}
 	//info.MsgID = serializeRmqID(0)
 	info.MsgID = kafka.SerializeKafkaID(0)
 	info.Timestamp = getCurrentTime()
-	info.ChannelName = strings.ReplaceAll(info.ChannelName, oldChanPrefix, newChanPrefix)
+
+	info.ChannelName = replace(info.ChannelName, newChanPrefix, false)
+}
+
+func replace(source, newChanPrefix string, skipFirst bool) string {
+	re := regexp.MustCompile(`(?m)(in01-[0-9a-zA-Z]+)`)
+	for i, match := range re.FindAllString(source, -1) {
+		if skipFirst && i == 0 {
+			continue
+		}
+		source = strings.ReplaceAll(source, match, newChanPrefix)
+	}
+	return source
 }
 
 // composeTS returns a timestamp composed of physical part and logical part
@@ -282,7 +286,7 @@ func getCurrentTime() uint64 {
 	return composeTSByTime(time.Now(), 0)
 }
 
-func resetSegmentCheckpoint(cli clientv3.KV, basePath string, oldChanPrefix, newChanPrefix string) error {
+func resetSegmentCheckpoint(cli clientv3.KV, basePath string, newChanPrefix string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
 	defer cancel()
 	resp, err := cli.Get(ctx, path.Join(basePath, "datacoord-meta/s"), clientv3.WithPrefix())
@@ -292,20 +296,19 @@ func resetSegmentCheckpoint(cli clientv3.KV, basePath string, oldChanPrefix, new
 
 	fmt.Println("== update segments key size:", len(resp.Kvs))
 	for _, kv := range resp.Kvs {
+		if strings.Contains(string(kv.Key), "statslog") {
+			continue
+		}
+
 		info := &datapb.SegmentInfo{}
 		err = proto.Unmarshal(kv.Value, info)
 		if err != nil {
 			continue
 		}
 
-		if !strings.HasPrefix(info.InsertChannel, oldChanPrefix) {
-			fmt.Printf("segment insert channel:%s has not a prefix:%s\n", info.InsertChannel, oldChanPrefix)
-			continue
-		}
-
-		replacePosition(info.StartPosition, oldChanPrefix, newChanPrefix)
-		replacePosition(info.DmlPosition, oldChanPrefix, newChanPrefix)
-		info.InsertChannel = strings.ReplaceAll(info.InsertChannel, oldChanPrefix, newChanPrefix)
+		replacePosition(info.StartPosition, newChanPrefix)
+		replacePosition(info.DmlPosition, newChanPrefix)
+		info.InsertChannel = replace(info.InsertChannel, newChanPrefix, false)
 
 		mv, err := proto.Marshal(info)
 		if err != nil {
@@ -323,7 +326,7 @@ func resetSegmentCheckpoint(cli clientv3.KV, basePath string, oldChanPrefix, new
 	return nil
 }
 
-func replacePChanPrefixWithinSchema(cli clientv3.KV, basePath, oldChanPrefix, newChanPrefix string) error {
+func replacePChanPrefixWithinSchema(cli clientv3.KV, basePath, newChanPrefix string) error {
 	keys0, values0, err0 := listCollections(cli, basePath, common.CollectionMetaPrefix)
 	if err0 != nil {
 		return err0
@@ -356,22 +359,12 @@ func replacePChanPrefixWithinSchema(cli clientv3.KV, basePath, oldChanPrefix, ne
 		newVChannels := make([]string, 0, len(v.VirtualChannelNames))
 
 		for _, e := range v.PhysicalChannelNames {
-			if !strings.HasPrefix(e, oldChanPrefix) {
-				fmt.Printf("collection:%s, pchannel:%s has not a prefix:%s\n", v.GetSchema().Name, e, oldChanPrefix)
-				continue
-			}
-
-			pchan := strings.ReplaceAll(e, oldChanPrefix, newChanPrefix)
+			pchan := replace(e, newChanPrefix, false)
 			newPChannels = append(newPChannels, pchan)
 		}
 
 		for _, e := range v.VirtualChannelNames {
-			if !strings.Contains(e, oldChanPrefix) {
-				fmt.Printf("collection:%s, vchannel:%s has not a prefix:%s\n", v.GetSchema().Name, e, oldChanPrefix)
-				continue
-			}
-
-			vchan := strings.ReplaceAll(e, oldChanPrefix, newChanPrefix)
+			vchan := replace(e, newChanPrefix, false)
 			newVChannels = append(newVChannels, vchan)
 		}
 
