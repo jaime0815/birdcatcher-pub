@@ -6,17 +6,17 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
-	"path"
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/birdwatcher/configs"
-	"github.com/milvus-io/birdwatcher/framework"
-	"github.com/milvus-io/birdwatcher/states/kv"
 	"github.com/tikv/client-go/v2/config"
 	"github.com/tikv/client-go/v2/txnkv"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/birdwatcher/configs"
+	"github.com/milvus-io/birdwatcher/framework"
+	"github.com/milvus-io/birdwatcher/states/kv"
 )
 
 const (
@@ -29,8 +29,7 @@ var (
 )
 
 func pingMetaStore(ctx context.Context, cli kv.MetaKV, rootPath string, metaPath string) error {
-	key := path.Join(rootPath, metaPath, "session/id")
-	_, err := cli.Load(ctx, key)
+	_, err := cli.GetAllRootPath(ctx)
 	if err != nil {
 		return err
 	}

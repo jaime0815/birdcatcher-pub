@@ -6,7 +6,6 @@ package states
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"path"
 	"regexp"
@@ -15,9 +14,8 @@ import (
 
 	"github.com/apache/pulsar-client-go/pulsar"
 	"github.com/golang/protobuf/proto"
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.uber.org/zap"
 
+	"github.com/milvus-io/birdwatcher/framework"
 	"github.com/milvus-io/birdwatcher/mq/kafka"
 	mypulsar "github.com/milvus-io/birdwatcher/mq/pulsar"
 	"github.com/milvus-io/birdwatcher/proto/v2.2/commonpb"
@@ -25,6 +23,7 @@ import (
 	etcdpbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/etcdpb"
 	"github.com/milvus-io/birdwatcher/proto/v2.2/internalpb"
 	"github.com/milvus-io/birdwatcher/states/etcd/common"
+	metakv "github.com/milvus-io/birdwatcher/states/kv"
 )
 
 var (
@@ -32,93 +31,45 @@ var (
 	channelRemoval = "datacoord-meta/channel-removal"
 	channelCP      = "datacoord-meta/channel-cp"
 	segmentPrefix  = "datacoord-meta/s"
+	paginationSize = 128
 )
 
-// RenameInstanceID Only support Kafka MQ
-// Usage:
-// ./bin/birdwatcher --setPChanPrefix --addr 10.15.29.220:2379 --rootPath in01-6b61b7649908674 --newPChanPrefix  in01-fbf9815060cce85
-func RenameInstanceID(addr, mqType, rootPath, newPChanNamePrefix string) error {
-	if len(addr) == 0 {
-		return errors.New("etcd address is empty")
-	}
-	if len(rootPath) == 0 {
-		return errors.New("etcd rootpath is empty")
-	}
+type RenameInstanceIDParam struct {
+	framework.ParamBase `use:"renameInstanceID"`
+	MqType              string `name:"mqType" default:"kafka" desc:"mq type: kafka or pulsar"`
+	NewInstanceID       string `name:"newInstanceID" default:"" desc:"dest new instance id"`
+}
 
-	if len(newPChanNamePrefix) == 0 {
-		return errors.New("newPChanPrefix is empty")
-	}
-
-	client, err := getETCDClient(&InstanceInfo{
-		Addr:     addr,
-		RootPath: rootPath,
-	})
-	if err != nil {
-		return err
-	}
-	defer client.Close()
-
-	fmt.Println("Using meta path:", fmt.Sprintf("%s/%s/", rootPath, metaPath))
-	basePath := path.Join(rootPath, metaPath)
-
-	if err = replacePChanPrefixWithinSchema(client, basePath, newPChanNamePrefix); err != nil {
+// RenameInstanceIDCommand returns command for rename instance id of all metadata
+func (s *InstanceState) RenameInstanceIDCommand(ctx context.Context, p *RenameInstanceIDParam) error {
+	if err := replacePChanPrefixWithinSchema(s.client, s.basePath, p.NewInstanceID); err != nil {
 		return err
 	}
 
-	if err = resetChannelCheckPoint(client, basePath, newPChanNamePrefix, mqType); err != nil {
+	if err := resetChannelCheckPoint(s.client, s.basePath, p.NewInstanceID, p.MqType); err != nil {
 		return err
 	}
 
-	if err = resetChannelWatch(client, basePath, newPChanNamePrefix); err != nil {
+	if err := resetChannelWatch(s.client, s.basePath, p.NewInstanceID); err != nil {
 		return err
 	}
 
-	if err = removeRemovalChannel(client, basePath); err != nil {
+	if err := removeRemovalChannel(s.client, s.basePath); err != nil {
 		return err
 	}
 
-	if err = resetSegmentCheckpoint(client, basePath, newPChanNamePrefix, mqType); err != nil {
+	if err := resetSegmentCheckpoint(s.client, s.basePath, p.NewInstanceID, p.MqType); err != nil {
 		return err
 	}
 
-	if err = renameRemainedKeys(client, rootPath, newPChanNamePrefix); err != nil {
+	if err := renameRemainedKeys(s.client, s.basePath, p.NewInstanceID); err != nil {
 		return err
 	}
+
 	return nil
 }
 
-func getETCDClient(instance *InstanceInfo) (*clientv3.Client, error) {
-	etcdCli, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{instance.Addr},
-		DialTimeout: time.Second * 60,
-
-		// disable grpc logging
-		Logger: zap.NewNop(),
-	})
-	if err != nil {
-		fmt.Println(err.Error())
-		return nil, err
-	}
-
-	rootPath := instance.RootPath
-	// ping etcd
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
-	defer cancel()
-	err = pingEtcd(ctx, etcdCli, rootPath, metaPath)
-	if err != nil {
-		if errors.Is(err, ErrNotMilvsuRootPath) {
-			etcdCli.Close()
-			fmt.Printf("Connection established, but %s, please check your config or use Dry mode\n", err.Error())
-			return nil, err
-		}
-		fmt.Println("cannot connect to etcd with addr:", instance.Addr, err.Error())
-		return nil, err
-	}
-
-	return etcdCli, nil
-}
-
-func listCollections(cli clientv3.KV, basePath string, metaPath string) ([]string, []etcdpbv2.CollectionInfo, error) {
+func listCollections(cli metakv.MetaKV, basePath string, metaPath string) ([]string, []etcdpbv2.CollectionInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
 	defer cancel()
 	colls, keys, err := common.ListProtoObjectsAdv(ctx, cli,
@@ -144,19 +95,18 @@ func listCollections(cli clientv3.KV, basePath string, metaPath string) ([]strin
 	return keys, colls, err
 }
 
-func resetChannelWatch(cli clientv3.KV, basePath string, newChanPrefix string) error {
+func resetChannelWatch(cli metakv.MetaKV, basePath string, newChanPrefix string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
 	defer cancel()
-	resp, err := cli.Get(ctx, path.Join(basePath, channelWatch), clientv3.WithPrefix())
+	keys, values, err := cli.LoadWithPrefix(ctx, path.Join(basePath, channelWatch))
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("== update channel-watch key size:", len(resp.Kvs))
-	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
+	fmt.Println("== start to update channel-watch key")
+	for i, key := range keys {
 		cw := &datapb.ChannelWatchInfo{}
-		if err := proto.Unmarshal(kv.Value, cw); err != nil {
+		if err := proto.Unmarshal([]byte(values[i]), cw); err != nil {
 			return err
 		}
 
@@ -177,43 +127,35 @@ func resetChannelWatch(cli clientv3.KV, basePath string, newChanPrefix string) e
 			return err
 		}
 	}
+
+	fmt.Println("== update channel-watch key count:", len(keys))
 	return nil
 }
 
-func removeRemovalChannel(cli clientv3.KV, basePath string) error {
+func removeRemovalChannel(cli metakv.MetaKV, basePath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
 	defer cancel()
-	resp, err := cli.Get(ctx, path.Join(basePath, channelRemoval), clientv3.WithPrefix())
-	if err != nil {
-		return err
-	}
-	fmt.Println("== remove channel-removal key size:", len(resp.Kvs))
-	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
-		_, err = cli.Delete(ctx, key)
-		if err != nil {
-			fmt.Printf("delete key:%s fails\n", key)
-			return err
-		}
-		fmt.Printf("delete key:%s successfully\n", key)
-	}
-
-	return nil
-}
-
-func resetChannelCheckPoint(cli clientv3.KV, basePath string, newChanPrefix string, mqType string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
-	defer cancel()
-	resp, err := cli.Get(ctx, path.Join(basePath, channelCP), clientv3.WithPrefix())
+	err := cli.RemoveWithPrefix(ctx, path.Join(basePath, channelRemoval))
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("== update channel-cp key size:", len(resp.Kvs))
-	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
+	fmt.Println("== remove channel-removal key successfully")
+	return nil
+}
+
+func resetChannelCheckPoint(cli metakv.MetaKV, basePath string, newChanPrefix string, mqType string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
+	defer cancel()
+	keys, values, err := cli.LoadWithPrefix(ctx, path.Join(basePath, channelCP))
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("== update channel-cp key count:", len(keys))
+	for i, key := range keys {
 		info := &internalpb.MsgPosition{}
-		err = proto.Unmarshal(kv.Value, info)
+		err = proto.Unmarshal([]byte(values[i]), info)
 		if err != nil {
 			continue
 		}
@@ -283,29 +225,23 @@ func getCurrentTime() uint64 {
 	return composeTSByTime(time.Now(), 0)
 }
 
-func resetSegmentCheckpoint(cli clientv3.KV, basePath string, newChanPrefix string, mqType string) error {
+func resetSegmentCheckpoint(cli metakv.MetaKV, basePath string, newChanPrefix string, mqType string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*900)
 	defer cancel()
-	resp, err := cli.Get(ctx, path.Join(basePath, segmentPrefix), clientv3.WithPrefix())
-	if err != nil {
-		return err
-	}
 
-	fmt.Println("== update segments key size:", len(resp.Kvs))
-	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
+	fmt.Println("== start to update segments key")
+	count := 0
+	err := cli.WalkWithPrefix(ctx, path.Join(basePath, segmentPrefix), paginationSize, func(k []byte, v []byte) error {
+		key := string(k)
 		if strings.Contains(key, "statslog") {
-			err = updateKeyValue(ctx, cli, key, newChanPrefix, string(kv.Value))
-			if err != nil {
-				return err
-			}
-			continue
+			count++
+			return updateKeyValue(ctx, cli, key, newChanPrefix, string(v))
 		}
 
 		info := &datapb.SegmentInfo{}
-		err = proto.Unmarshal(kv.Value, info)
+		err := proto.Unmarshal(v, info)
 		if err != nil {
-			continue
+			return err
 		}
 
 		replacePosition(info.StartPosition, newChanPrefix, mqType)
@@ -321,17 +257,26 @@ func resetSegmentCheckpoint(cli clientv3.KV, basePath string, newChanPrefix stri
 		if err != nil {
 			return err
 		}
+
+		count++
+		return nil
+	})
+
+	if err != nil {
+		return err
 	}
+
+	fmt.Println("== update segments key successfully, count:", count)
 	return nil
 }
 
-func replacePChanPrefixWithinSchema(cli clientv3.KV, basePath, newChanPrefix string) error {
+func replacePChanPrefixWithinSchema(cli metakv.MetaKV, basePath, newChanPrefix string) error {
 	keys0, values0, err0 := listCollections(cli, basePath, common.CollectionMetaPrefix)
 	if err0 != nil {
 		return err0
 	}
 
-	keys1, values1, err1 := listCollections(cli, basePath, common.CollectionInfoMetaPrefix)
+	keys1, values1, err1 := listCollections(cli, basePath, common.DBCollectionMetaPrefix)
 	if err1 != nil {
 		return err1
 	}
@@ -401,15 +346,15 @@ func replacePChanPrefixWithinSchema(cli clientv3.KV, basePath, newChanPrefix str
 	return nil
 }
 
-func updateKeyValue(ctx context.Context, cli clientv3.KV, key, newChanPrefix, value string) error {
+func updateKeyValue(ctx context.Context, cli metakv.MetaKV, key, newChanPrefix, value string) error {
 	newKey := replace(key, newChanPrefix)
-	_, err := cli.Put(ctx, newKey, value)
+	err := cli.Save(ctx, newKey, value)
 	if err != nil {
 		fmt.Printf("rename key:%s, update value fails\n", key)
 		return err
 	}
 
-	_, err = cli.Delete(ctx, key)
+	err = cli.Remove(ctx, key)
 	if err != nil {
 		fmt.Printf("delete key:%s fails\n", key)
 		return err
@@ -418,48 +363,36 @@ func updateKeyValue(ctx context.Context, cli clientv3.KV, key, newChanPrefix, va
 	return nil
 }
 
-func renameRemainedKeys(cli clientv3.KV, basePath string, newChanPrefix string) error {
+func renameRemainedKeys(cli metakv.MetaKV, basePath string, newChanPrefix string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*15)
 	defer cancel()
 
-	batch := int64(500)
-	opts := []clientv3.OpOption{
-		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
-		clientv3.WithLimit(batch),
-		clientv3.WithRange(clientv3.GetPrefixRangeEnd(basePath)),
-	}
+	count := 0
+	fmt.Println("== start to rename remained keys")
+	err := cli.WalkWithPrefix(ctx, basePath, paginationSize, func(key []byte, value []byte) error {
+		k := string(key)
+		if strings.Contains(k, channelWatch) ||
+			strings.Contains(k, channelRemoval) ||
+			strings.Contains(k, channelCP) ||
+			strings.Contains(k, segmentPrefix) ||
+			strings.Contains(k, common.CollectionMetaPrefix) ||
+			strings.Contains(k, common.DBCollectionMetaPrefix) {
+			return nil
+		}
 
-	fmt.Println("== rename remained keys:")
-	key := basePath
-	for {
-		resp, err := cli.Get(ctx, key, opts...)
+		err := updateKeyValue(ctx, cli, k, newChanPrefix, string(value))
 		if err != nil {
 			return err
 		}
 
-		for _, kv := range resp.Kvs {
-			k := string(kv.Key)
-			if strings.Contains(k, channelWatch) ||
-				strings.Contains(k, channelRemoval) ||
-				strings.Contains(k, channelCP) ||
-				strings.Contains(k, segmentPrefix) ||
-				strings.Contains(k, common.CollectionMetaPrefix) ||
-				strings.Contains(k, common.CollectionInfoMetaPrefix) {
-				continue
-			}
+		count++
+		return nil
+	})
 
-			err := updateKeyValue(ctx, cli, k, newChanPrefix, string(kv.Value))
-			if err != nil {
-				return err
-			}
-		}
-
-		if !resp.More {
-			break
-		}
-		// move to next key
-		key = string(append(resp.Kvs[len(resp.Kvs)-1].Key, 0))
+	if err != nil {
+		return err
 	}
+	fmt.Println("rename remained keys successfully, count:", count)
 	return nil
 }
 
