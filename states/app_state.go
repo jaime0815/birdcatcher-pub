@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/samber/lo"
+	"github.com/spf13/cobra"
+
 	"github.com/milvus-io/birdwatcher/configs"
 	"github.com/milvus-io/birdwatcher/framework"
 	"github.com/milvus-io/birdwatcher/states/storage"
-	"github.com/samber/lo"
-	"github.com/spf13/cobra"
 )
 
 // ApplicationState application background state.
@@ -43,7 +44,10 @@ func (app *ApplicationState) Label() string {
 
 func (app *ApplicationState) Process(cmd string) (framework.State, error) {
 	app.config.Log("[INFO] begin to process command", cmd)
-	app.core.Process(cmd)
+	_, err := app.core.Process(cmd)
+	if err != nil {
+		return app, err
+	}
 	// perform sub state transfer
 	for key, state := range app.states {
 		next := state.NextState()

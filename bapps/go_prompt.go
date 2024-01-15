@@ -10,10 +10,11 @@ import (
 	"time"
 
 	"github.com/c-bata/go-prompt"
+	"github.com/samber/lo"
+
 	"github.com/milvus-io/birdwatcher/configs"
 	"github.com/milvus-io/birdwatcher/framework"
 	"github.com/milvus-io/birdwatcher/history"
-	"github.com/samber/lo"
 )
 
 // PromptApp wraps go-prompt as application.
@@ -75,9 +76,10 @@ func NewPromptApp(config *configs.Config, opts ...AppOption) BApp {
 	return pa
 }
 
-func (a *PromptApp) Run(start framework.State) {
+func (a *PromptApp) Run(start framework.State) error {
 	a.currentState = start
 	a.prompt.Run()
+	return nil
 }
 
 // promptExecute actual execution logic entry.

@@ -63,7 +63,13 @@ func main() {
 	start := states.Start(config)
 
 	app := appFactory(config)
-	app.Run(start)
+
+	err = app.Run(start)
+	if err != nil {
+		os.Exit(1)
+	} else {
+		os.Exit(0)
+	}
 }
 
 // handleExit is the fix for go-prompt output hi-jack fix.

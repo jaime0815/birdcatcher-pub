@@ -28,7 +28,7 @@ var (
 	ErrNotMilvsuRootPath = errors.New("is not a Milvus RootPath")
 )
 
-func pingMetaStore(ctx context.Context, cli kv.MetaKV, rootPath string, metaPath string) error {
+func pingMetaStore(ctx context.Context, cli kv.MetaKV) error {
 	_, err := cli.GetAllRootPath(ctx)
 	if err != nil {
 		return err
@@ -65,7 +65,7 @@ func (app *ApplicationState) connectTiKV(ctx context.Context, cp *ConnectParams)
 	if !cp.Dry {
 		ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 		defer cancel()
-		err = pingMetaStore(ctx, cli, cp.RootPath, cp.MetaPath)
+		err = pingMetaStore(ctx, cli)
 		if err != nil {
 			if errors.Is(err, ErrNotMilvsuRootPath) {
 				if !cp.Force {
@@ -116,7 +116,7 @@ func (app *ApplicationState) connectEtcd(ctx context.Context, cp *ConnectParams)
 		// ping etcd
 		ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 		defer cancel()
-		err = pingMetaStore(ctx, cli, cp.RootPath, cp.MetaPath)
+		err = pingMetaStore(ctx, cli)
 		if err != nil {
 			if errors.Is(err, ErrNotMilvsuRootPath) {
 				if !cp.Force {
@@ -277,7 +277,7 @@ func (p *UseParam) ParseArgs(args []string) error {
 }
 
 func (s *kvConnectedState) UseCommand(ctx context.Context, p *UseParam) error {
-	err := pingMetaStore(ctx, s.client, p.instanceName, p.MetaPath)
+	err := pingMetaStore(ctx, s.client)
 	if err != nil {
 		if errors.Is(err, ErrNotMilvsuRootPath) {
 			if !p.Force {

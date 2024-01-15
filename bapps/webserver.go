@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
 	"github.com/milvus-io/birdwatcher/common"
 	"github.com/milvus-io/birdwatcher/configs"
 	"github.com/milvus-io/birdwatcher/framework"
@@ -28,7 +29,7 @@ type InstanceInfo struct {
 	RootPath string `form:"rootPath"`
 }
 
-func (app *WebServerApp) Run(framework.State) {
+func (app *WebServerApp) Run(framework.State) error {
 	r := gin.Default()
 	etcdversion.SetVersion(models.GTEVersion2_2)
 
@@ -39,6 +40,7 @@ func (app *WebServerApp) Run(framework.State) {
 	app.ParseRouter(r, &states.InstanceState{})
 
 	r.Run(fmt.Sprintf(":%d", app.port))
+	return nil
 }
 
 func (app *WebServerApp) ParseRouter(r *gin.Engine, s framework.State) {

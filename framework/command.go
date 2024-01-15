@@ -121,9 +121,11 @@ func parseMethod(state State, mt reflect.Method) (*cobra.Command, []string, bool
 				// error nil, skip
 				if result.IsNil() {
 					continue
+
 				}
 				err := result.Interface().(error)
-				fmt.Println(err.Error())
+				err = fmt.Errorf("cmd:%s, args: %s running failed, %w", mt.Name, args, err)
+				panic(err)
 				return
 			case result.Type().Implements(reflect.TypeOf((*ResultSet)(nil)).Elem()):
 				if result.IsNil() {

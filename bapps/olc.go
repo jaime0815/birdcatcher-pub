@@ -5,8 +5,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/milvus-io/birdwatcher/framework"
 	"github.com/samber/lo"
+
+	"github.com/milvus-io/birdwatcher/framework"
 )
 
 type olcApp struct {
@@ -24,7 +25,7 @@ func NewOlcApp(script string) BApp {
 	}
 }
 
-func (a *olcApp) Run(start framework.State) {
+func (a *olcApp) Run(start framework.State) error {
 	app := start
 	cmds := a.parseScripts(a.script)
 	var err error
@@ -36,14 +37,15 @@ func (a *olcApp) Run(start framework.State) {
 		}
 		app, err = app.Process(cmd.cmd)
 		if err != nil {
-			fmt.Println(err.Error())
-			return
+			fmt.Println("running cmd:", cmd.cmd, " failed,", err.Error())
+			return err
 		}
 		if cmd.muted {
 			os.Stdout = stdout
 		}
 		app.SetupCommands()
 	}
+	return nil
 }
 
 func (a *olcApp) parseScripts(script string) []olcCmd {

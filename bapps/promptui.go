@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/manifoldco/promptui"
+
 	"github.com/milvus-io/birdwatcher/common"
 	"github.com/milvus-io/birdwatcher/framework"
 )
@@ -18,7 +19,7 @@ func NewSimpleApp() BApp {
 }
 
 // Run starts BirdWatcher with promptui. (disable suggestion and history)
-func (a *simpleApp) Run(start framework.State) {
+func (a *simpleApp) Run(start framework.State) error {
 	app := start
 	for {
 		p := promptui.Prompt{
@@ -35,9 +36,10 @@ func (a *simpleApp) Run(start framework.State) {
 				break
 			}
 			if app.IsEnding() {
-				return
+				return nil
 			}
 			app.SetupCommands()
 		}
 	}
+	return nil
 }

@@ -8,7 +8,7 @@ import (
 
 // BApp interface for birdwatcher application
 type BApp interface {
-	Run(framework.State)
+	Run(framework.State) error
 }
 
 // AppOption application setup option function.

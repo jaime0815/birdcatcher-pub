@@ -4,9 +4,11 @@
 package states
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"maps"
 	"path"
 	"regexp"
 	"strings"
@@ -42,6 +44,7 @@ type RenameInstanceIDParam struct {
 
 // RenameInstanceIDCommand returns command for rename instance id of all metadata
 func (s *InstanceState) RenameInstanceIDCommand(ctx context.Context, p *RenameInstanceIDParam) error {
+	fmt.Println("start to execute RenameInstanceIDCommand")
 	if err := replacePChanPrefixWithinSchema(s.client, s.basePath, p.NewInstanceID); err != nil {
 		return err
 	}
@@ -69,34 +72,51 @@ func (s *InstanceState) RenameInstanceIDCommand(ctx context.Context, p *RenameIn
 	return nil
 }
 
-func listCollections(cli metakv.MetaKV, basePath string, metaPath string) ([]string, []etcdpbv2.CollectionInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
+func listCollectionProtoObjects(ctx context.Context, kv metakv.MetaKV, prefix string) (map[string]*etcdpbv2.CollectionInfo, map[string]string, error) {
+	keys, vals, err := kv.LoadWithPrefix(ctx, prefix)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(keys) != len(vals) {
+		return nil, nil, fmt.Errorf("Error: keys and vals of different size in listCollectionProtoObjects:%d vs %d", len(keys), len(vals))
+	}
+	validCollections := make(map[string]*etcdpbv2.CollectionInfo)
+	invalidCollections := make(map[string]string)
+
+	for i, val := range vals {
+		if bytes.Equal([]byte(val), common.CollectionTombstone) {
+			invalidCollections[keys[i]] = val
+			continue
+		}
+
+		var elem etcdpbv2.CollectionInfo
+		err = proto.Unmarshal([]byte(val), &elem)
+		if err != nil {
+			fmt.Println(err.Error())
+			continue
+		}
+		validCollections[keys[i]] = &elem
+	}
+
+	return validCollections, invalidCollections, nil
+}
+
+func listCollections(cli metakv.MetaKV, basePath string, metaPath string) (map[string]*etcdpbv2.CollectionInfo, map[string]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*900)
 	defer cancel()
-	colls, keys, err := common.ListProtoObjectsAdv(ctx, cli,
-		path.Join(basePath, metaPath),
-		func(_ string, value []byte) bool {
-			return true
-		},
-		func(info *etcdpbv2.CollectionInfo) bool {
-			return true
-		})
+	validCollections, invalidCollections, err := listCollectionProtoObjects(ctx, cli, path.Join(basePath, metaPath))
 
-	snapshotColls, snapshotKeys, err := common.ListProtoObjectsAdv(ctx, cli,
-		path.Join(basePath, path.Join("snapshots", metaPath)),
-		func(_ string, value []byte) bool {
-			return true
-		},
-		func(info *etcdpbv2.CollectionInfo) bool {
-			return true
-		})
+	snapshotValidCollections, snapshotInvalidCollections, err :=
+		listCollectionProtoObjects(ctx, cli, path.Join(basePath, path.Join("snapshots", metaPath)))
 
-	keys = append(keys, snapshotKeys...)
-	colls = append(colls, snapshotColls...)
-	return keys, colls, err
+	maps.Copy(validCollections, snapshotValidCollections)
+	maps.Copy(invalidCollections, snapshotInvalidCollections)
+
+	return validCollections, invalidCollections, err
 }
 
 func resetChannelWatch(cli metakv.MetaKV, basePath string, newChanPrefix string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
 	defer cancel()
 	keys, values, err := cli.LoadWithPrefix(ctx, path.Join(basePath, channelWatch))
 	if err != nil {
@@ -133,7 +153,7 @@ func resetChannelWatch(cli metakv.MetaKV, basePath string, newChanPrefix string)
 }
 
 func removeRemovalChannel(cli metakv.MetaKV, basePath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
 	defer cancel()
 	err := cli.RemoveWithPrefix(ctx, path.Join(basePath, channelRemoval))
 	if err != nil {
@@ -145,7 +165,7 @@ func removeRemovalChannel(cli metakv.MetaKV, basePath string) error {
 }
 
 func resetChannelCheckPoint(cli metakv.MetaKV, basePath string, newChanPrefix string, mqType string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
 	defer cancel()
 	keys, values, err := cli.LoadWithPrefix(ctx, path.Join(basePath, channelCP))
 	if err != nil {
@@ -226,7 +246,7 @@ func getCurrentTime() uint64 {
 }
 
 func resetSegmentCheckpoint(cli metakv.MetaKV, basePath string, newChanPrefix string, mqType string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*900)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*1800)
 	defer cancel()
 
 	fmt.Println("== start to update segments key")
@@ -271,34 +291,24 @@ func resetSegmentCheckpoint(cli metakv.MetaKV, basePath string, newChanPrefix st
 }
 
 func replacePChanPrefixWithinSchema(cli metakv.MetaKV, basePath, newChanPrefix string) error {
-	keys0, values0, err0 := listCollections(cli, basePath, common.CollectionMetaPrefix)
+	validCollections0, invalidCollections0, err0 := listCollections(cli, basePath, common.CollectionMetaPrefix)
 	if err0 != nil {
 		return err0
 	}
 
-	keys1, values1, err1 := listCollections(cli, basePath, common.DBCollectionMetaPrefix)
+	validCollections1, invalidCollections1, err1 := listCollections(cli, basePath, common.DBCollectionMetaPrefix)
 	if err1 != nil {
 		return err1
 	}
 
-	keys := make([]string, 0)
-	keys = append(keys, keys0...)
-	keys = append(keys, keys1...)
+	maps.Copy(validCollections0, validCollections1)
+	maps.Copy(invalidCollections0, invalidCollections1)
 
-	values := make([]etcdpbv2.CollectionInfo, 0)
-	values = append(values, values0...)
-	values = append(values, values1...)
-
-	if len(keys) != len(values) {
-		return fmt.Errorf("keys size:%d is not equal value size:%d", len(keys), len(values))
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*900)
 	defer cancel()
 
-	fmt.Println("== update channel prefix of schema key size:", len(keys))
-	for i, k := range keys {
-		v := values[i]
+	fmt.Println("== update channel prefix of schema key size:", len(validCollections0)+len(invalidCollections0))
+	for k, v := range validCollections0 {
 		newPChannels := make([]string, 0, len(v.PhysicalChannelNames))
 		newVChannels := make([]string, 0, len(v.VirtualChannelNames))
 
@@ -330,7 +340,7 @@ func replacePChanPrefixWithinSchema(cli metakv.MetaKV, basePath, newChanPrefix s
 		}
 
 		v.StartPositions = toKeyDataPairs(sp)
-		mv, err := proto.Marshal(&v)
+		mv, err := proto.Marshal(v)
 		if err != nil {
 			return fmt.Errorf("failed to marshal collection info: %s", err.Error())
 		}
@@ -341,7 +351,16 @@ func replacePChanPrefixWithinSchema(cli metakv.MetaKV, basePath, newChanPrefix s
 			return err
 		}
 	}
+	fmt.Println("== update channel prefix of valid collections:", len(validCollections0))
 
+	for k, v := range invalidCollections0 {
+		err := updateKeyValue(ctx, cli, k, newChanPrefix, v)
+		if err != nil {
+			fmt.Printf("collection key:%s, update value fails\n", k)
+			return err
+		}
+	}
+	fmt.Println("== update channel prefix of invalid collections:", len(invalidCollections0))
 	fmt.Println("replace channel prefix and reset start position successfully")
 	return nil
 }
@@ -364,7 +383,7 @@ func updateKeyValue(ctx context.Context, cli metakv.MetaKV, key, newChanPrefix, 
 }
 
 func renameRemainedKeys(cli metakv.MetaKV, basePath string, newChanPrefix string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*15)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*1800)
 	defer cancel()
 
 	count := 0
