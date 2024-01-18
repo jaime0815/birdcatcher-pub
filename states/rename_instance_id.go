@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"maps"
 	"path"
-	"regexp"
 	"strings"
 	"time"
 
@@ -45,27 +44,27 @@ type RenameInstanceIDParam struct {
 // RenameInstanceIDCommand returns command for rename instance id of all metadata
 func (s *InstanceState) RenameInstanceIDCommand(ctx context.Context, p *RenameInstanceIDParam) error {
 	fmt.Println("start to execute RenameInstanceIDCommand")
-	if err := replacePChanPrefixWithinSchema(s.client, s.basePath, p.NewInstanceID); err != nil {
+	if err := s.replacePChanPrefixWithinSchema(p.NewInstanceID); err != nil {
 		return err
 	}
 
-	if err := resetChannelCheckPoint(s.client, s.basePath, p.NewInstanceID, p.MqType); err != nil {
+	if err := s.resetChannelCheckPoint(p.NewInstanceID, p.MqType); err != nil {
 		return err
 	}
 
-	if err := resetChannelWatch(s.client, s.basePath, p.NewInstanceID); err != nil {
+	if err := s.resetChannelWatch(p.NewInstanceID); err != nil {
 		return err
 	}
 
-	if err := removeRemovalChannel(s.client, s.basePath); err != nil {
+	if err := s.removeRemovalChannel(); err != nil {
 		return err
 	}
 
-	if err := resetSegmentCheckpoint(s.client, s.basePath, p.NewInstanceID, p.MqType); err != nil {
+	if err := s.resetSegmentCheckpoint(p.NewInstanceID, p.MqType); err != nil {
 		return err
 	}
 
-	if err := renameRemainedKeys(s.client, s.basePath, p.NewInstanceID); err != nil {
+	if err := s.renameRemainedKeys(p.NewInstanceID); err != nil {
 		return err
 	}
 
@@ -115,10 +114,10 @@ func listCollections(cli metakv.MetaKV, basePath string, metaPath string) (map[s
 	return validCollections, invalidCollections, err
 }
 
-func resetChannelWatch(cli metakv.MetaKV, basePath string, newChanPrefix string) error {
+func (s *InstanceState) resetChannelWatch(newChanPrefix string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
 	defer cancel()
-	keys, values, err := cli.LoadWithPrefix(ctx, path.Join(basePath, channelWatch))
+	keys, values, err := s.client.LoadWithPrefix(ctx, path.Join(s.basePath, channelWatch))
 	if err != nil {
 		return err
 	}
@@ -130,7 +129,7 @@ func resetChannelWatch(cli metakv.MetaKV, basePath string, newChanPrefix string)
 			return err
 		}
 
-		vChannelName := replace(cw.Vchan.ChannelName, newChanPrefix)
+		vChannelName := s.replace(cw.Vchan.ChannelName, newChanPrefix)
 		vChanInfo := &datapb.VchannelInfo{
 			ChannelName:  vChannelName,
 			CollectionID: cw.Vchan.CollectionID,
@@ -142,7 +141,7 @@ func resetChannelWatch(cli metakv.MetaKV, basePath string, newChanPrefix string)
 			return fmt.Errorf("failed to marshal VchannelInfo: %s", err.Error())
 		}
 
-		err = updateKeyValue(ctx, cli, key, newChanPrefix, string(mv))
+		err = s.updateKeyValue(ctx, key, newChanPrefix, string(mv))
 		if err != nil {
 			return err
 		}
@@ -152,10 +151,10 @@ func resetChannelWatch(cli metakv.MetaKV, basePath string, newChanPrefix string)
 	return nil
 }
 
-func removeRemovalChannel(cli metakv.MetaKV, basePath string) error {
+func (s *InstanceState) removeRemovalChannel() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
 	defer cancel()
-	err := cli.RemoveWithPrefix(ctx, path.Join(basePath, channelRemoval))
+	err := s.client.RemoveWithPrefix(ctx, path.Join(s.basePath, channelRemoval))
 	if err != nil {
 		return err
 	}
@@ -164,10 +163,10 @@ func removeRemovalChannel(cli metakv.MetaKV, basePath string) error {
 	return nil
 }
 
-func resetChannelCheckPoint(cli metakv.MetaKV, basePath string, newChanPrefix string, mqType string) error {
+func (s *InstanceState) resetChannelCheckPoint(newChanPrefix string, mqType string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
 	defer cancel()
-	keys, values, err := cli.LoadWithPrefix(ctx, path.Join(basePath, channelCP))
+	keys, values, err := s.client.LoadWithPrefix(ctx, path.Join(s.basePath, channelCP))
 	if err != nil {
 		return err
 	}
@@ -180,13 +179,13 @@ func resetChannelCheckPoint(cli metakv.MetaKV, basePath string, newChanPrefix st
 			continue
 		}
 
-		replacePosition(info, newChanPrefix, mqType)
+		s.replacePosition(info, newChanPrefix, mqType)
 		mv, err := proto.Marshal(info)
 		if err != nil {
 			return fmt.Errorf("failed to marshal msg position info: %s", err.Error())
 		}
 
-		err = updateKeyValue(ctx, cli, key, newChanPrefix, string(mv))
+		err = s.updateKeyValue(ctx, key, newChanPrefix, string(mv))
 		if err != nil {
 			return err
 		}
@@ -202,7 +201,7 @@ func serializeRmqID(messageID int64) []byte {
 	return b
 }
 
-func replacePosition(info *internalpb.MsgPosition, newChanPrefix string, mqType string) {
+func (s *InstanceState) replacePosition(info *internalpb.MsgPosition, newChanPrefix string, mqType string) {
 	if info == nil {
 		return
 	}
@@ -219,15 +218,11 @@ func replacePosition(info *internalpb.MsgPosition, newChanPrefix string, mqType 
 	}
 
 	info.Timestamp = getCurrentTime()
-	info.ChannelName = replace(info.ChannelName, newChanPrefix)
+	info.ChannelName = s.replace(info.ChannelName, newChanPrefix)
 }
 
-func replace(source, newChanPrefix string) string {
-	re := regexp.MustCompile(`(?m)(in01-[0-9a-zA-Z]+)`)
-	for _, match := range re.FindAllString(source, -1) {
-		source = strings.ReplaceAll(source, match, newChanPrefix)
-	}
-	return source
+func (s *InstanceState) replace(source, newChanPrefix string) string {
+	return strings.Replace(source, s.instanceName, newChanPrefix, -1)
 }
 
 // composeTS returns a timestamp composed of physical part and logical part
@@ -245,17 +240,17 @@ func getCurrentTime() uint64 {
 	return composeTSByTime(time.Now(), 0)
 }
 
-func resetSegmentCheckpoint(cli metakv.MetaKV, basePath string, newChanPrefix string, mqType string) error {
+func (s *InstanceState) resetSegmentCheckpoint(newChanPrefix string, mqType string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*1800)
 	defer cancel()
 
 	fmt.Println("== start to update segments key")
 	count := 0
-	err := cli.WalkWithPrefix(ctx, path.Join(basePath, segmentPrefix), paginationSize, func(k []byte, v []byte) error {
+	err := s.client.WalkWithPrefix(ctx, path.Join(s.basePath, segmentPrefix), paginationSize, func(k []byte, v []byte) error {
 		key := string(k)
 		if strings.Contains(key, "statslog") {
 			count++
-			return updateKeyValue(ctx, cli, key, newChanPrefix, string(v))
+			return s.updateKeyValue(ctx, key, newChanPrefix, string(v))
 		}
 
 		info := &datapb.SegmentInfo{}
@@ -264,16 +259,16 @@ func resetSegmentCheckpoint(cli metakv.MetaKV, basePath string, newChanPrefix st
 			return err
 		}
 
-		replacePosition(info.StartPosition, newChanPrefix, mqType)
-		replacePosition(info.DmlPosition, newChanPrefix, mqType)
-		info.InsertChannel = replace(info.InsertChannel, newChanPrefix)
+		s.replacePosition(info.StartPosition, newChanPrefix, mqType)
+		s.replacePosition(info.DmlPosition, newChanPrefix, mqType)
+		info.InsertChannel = s.replace(info.InsertChannel, newChanPrefix)
 
 		mv, err := proto.Marshal(info)
 		if err != nil {
 			return fmt.Errorf("failed to marshal segment info: %s", err.Error())
 		}
 
-		err = updateKeyValue(ctx, cli, key, newChanPrefix, string(mv))
+		err = s.updateKeyValue(ctx, key, newChanPrefix, string(mv))
 		if err != nil {
 			return err
 		}
@@ -290,13 +285,13 @@ func resetSegmentCheckpoint(cli metakv.MetaKV, basePath string, newChanPrefix st
 	return nil
 }
 
-func replacePChanPrefixWithinSchema(cli metakv.MetaKV, basePath, newChanPrefix string) error {
-	validCollections0, invalidCollections0, err0 := listCollections(cli, basePath, common.CollectionMetaPrefix)
+func (s *InstanceState) replacePChanPrefixWithinSchema(newChanPrefix string) error {
+	validCollections0, invalidCollections0, err0 := listCollections(s.client, s.basePath, common.CollectionMetaPrefix)
 	if err0 != nil {
 		return err0
 	}
 
-	validCollections1, invalidCollections1, err1 := listCollections(cli, basePath, common.DBCollectionMetaPrefix)
+	validCollections1, invalidCollections1, err1 := listCollections(s.client, s.basePath, common.DBCollectionMetaPrefix)
 	if err1 != nil {
 		return err1
 	}
@@ -313,12 +308,12 @@ func replacePChanPrefixWithinSchema(cli metakv.MetaKV, basePath, newChanPrefix s
 		newVChannels := make([]string, 0, len(v.VirtualChannelNames))
 
 		for _, e := range v.PhysicalChannelNames {
-			pchan := replace(e, newChanPrefix)
+			pchan := s.replace(e, newChanPrefix)
 			newPChannels = append(newPChannels, pchan)
 		}
 
 		for _, e := range v.VirtualChannelNames {
-			vchan := replace(e, newChanPrefix)
+			vchan := s.replace(e, newChanPrefix)
 			newVChannels = append(newVChannels, vchan)
 		}
 
@@ -345,7 +340,7 @@ func replacePChanPrefixWithinSchema(cli metakv.MetaKV, basePath, newChanPrefix s
 			return fmt.Errorf("failed to marshal collection info: %s", err.Error())
 		}
 
-		err = updateKeyValue(ctx, cli, k, newChanPrefix, string(mv))
+		err = s.updateKeyValue(ctx, k, newChanPrefix, string(mv))
 		if err != nil {
 			fmt.Printf("collection key:%s, update value fails\n", k)
 			return err
@@ -354,7 +349,7 @@ func replacePChanPrefixWithinSchema(cli metakv.MetaKV, basePath, newChanPrefix s
 	fmt.Println("== update channel prefix of valid collections:", len(validCollections0))
 
 	for k, v := range invalidCollections0 {
-		err := updateKeyValue(ctx, cli, k, newChanPrefix, v)
+		err := s.updateKeyValue(ctx, k, newChanPrefix, v)
 		if err != nil {
 			fmt.Printf("collection key:%s, update value fails\n", k)
 			return err
@@ -365,30 +360,30 @@ func replacePChanPrefixWithinSchema(cli metakv.MetaKV, basePath, newChanPrefix s
 	return nil
 }
 
-func updateKeyValue(ctx context.Context, cli metakv.MetaKV, key, newChanPrefix, value string) error {
-	newKey := replace(key, newChanPrefix)
-	err := cli.Save(ctx, newKey, value)
+func (s *InstanceState) updateKeyValue(ctx context.Context, key, newChanPrefix, value string) error {
+	newKey := s.replace(key, newChanPrefix)
+	err := s.client.Save(ctx, newKey, value)
 	if err != nil {
 		fmt.Printf("rename key:%s, update value fails\n", key)
 		return err
 	}
 
-	err = cli.Remove(ctx, key)
+	err = s.client.Remove(ctx, key)
 	if err != nil {
 		fmt.Printf("delete key:%s fails\n", key)
 		return err
 	}
-	fmt.Printf("rename key:%s done\n", key)
+	fmt.Printf("rename key:%s to %s done\n", key, newKey)
 	return nil
 }
 
-func renameRemainedKeys(cli metakv.MetaKV, basePath string, newChanPrefix string) error {
+func (s *InstanceState) renameRemainedKeys(newChanPrefix string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*1800)
 	defer cancel()
 
 	count := 0
 	fmt.Println("== start to rename remained keys")
-	err := cli.WalkWithPrefix(ctx, basePath, paginationSize, func(key []byte, value []byte) error {
+	err := s.client.WalkWithPrefix(ctx, s.basePath, paginationSize, func(key []byte, value []byte) error {
 		k := string(key)
 		if strings.Contains(k, channelWatch) ||
 			strings.Contains(k, channelRemoval) ||
@@ -399,7 +394,7 @@ func renameRemainedKeys(cli metakv.MetaKV, basePath string, newChanPrefix string
 			return nil
 		}
 
-		err := updateKeyValue(ctx, cli, k, newChanPrefix, string(value))
+		err := s.updateKeyValue(ctx, k, newChanPrefix, string(value))
 		if err != nil {
 			return err
 		}
