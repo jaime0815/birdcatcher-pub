@@ -5,11 +5,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/milvus-io/birdwatcher/framework"
 	"github.com/milvus-io/birdwatcher/models"
-	"github.com/milvus-io/birdwatcher/states/etcd/common"
-	etcdversion "github.com/milvus-io/birdwatcher/states/etcd/version"
 	"github.com/milvus-io/birdwatcher/utils"
 )
 
@@ -23,51 +22,41 @@ type CollectionParam struct {
 	State               string `name:"state" default:"" desc:"collection state to filter"`
 }
 
+func replace(source, old, newChanPrefix string) string {
+	return strings.Replace(source, old, newChanPrefix, -1)
+}
+
 func (c *ComponentShow) CollectionCommand(ctx context.Context, p *CollectionParam) (*Collections, error) {
-	var collections []*models.Collection
-	var total int64
-	var err error
-	// perform get by id to accelerate
-	if p.CollectionID > 0 {
-		var collection *models.Collection
-		collection, err = common.GetCollectionByIDVersion(ctx, c.client, c.basePath, etcdversion.GetVersion(), p.CollectionID)
-		if err == nil {
-			collections = append(collections, collection)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
+	defer cancel()
+
+	count := 0
+	fmt.Println("== start to rename remained keys")
+	prefix := "in01-6d348b125a73b89/kv"
+	err := c.client.WalkWithPrefix(ctx, prefix, 10, func(key []byte, value []byte) error {
+		k := string(key)
+		newKey := replace(k, "in01-6d348b125a73b89", "6d348b125a73b89")
+		err := c.client.Save(ctx, newKey, string(value))
+		if err != nil {
+			fmt.Printf("rename key:%s, update value fails\n", key)
+			return err
 		}
-	} else {
-		collections, err = common.ListCollectionsVersion(ctx, c.client, c.basePath, etcdversion.GetVersion(), func(coll *models.Collection) bool {
-			if p.CollectionName != "" && coll.Schema.Name != p.CollectionName {
-				return false
-			}
-			if p.DatabaseID > -1 && coll.DBID != p.DatabaseID {
-				return false
-			}
-			if p.State != "" && !strings.EqualFold(p.State, coll.State.String()) {
-				return false
-			}
-			total++
-			return true
-		})
-	}
+
+		err = c.client.Remove(ctx, k)
+		if err != nil {
+			fmt.Printf("delete key:%s fails\n", key)
+			return err
+		}
+		fmt.Printf("rename key:%s to %s done\n", key, newKey)
+
+		count++
+		return nil
+	})
 
 	if err != nil {
-		return nil, err
+		fmt.Printf("rename fails, %w\n", err)
 	}
-	channels := 0
-	healthy := 0
-	for _, collection := range collections {
-		if collection.State == models.CollectionStateCollectionCreated {
-			channels += len(collection.Channels)
-			healthy++
-		}
-	}
-
-	return &Collections{
-		collections: collections,
-		total:       total,
-		channels:    channels,
-		healthy:     healthy,
-	}, nil
+	return &Collections{}, nil
 }
 
 type Collections struct {
